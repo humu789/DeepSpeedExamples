@@ -161,10 +161,10 @@ def parse_args():
     parser.add_argument("--clean_best_model", action="store_true", help="clean the  model")
     parser.add_argument("--distill_method", type=str, default=None, help="knowledage distillation")   
     parser.add_argument(
-        "--local_rank",
+        "--local-rank",
         type=int,
         default=-1,
-        help="local_rank for distributed training on gpus")
+        help="local-rank for distributed training on gpus")
     parser.add_argument(
         "--model_name_or_path_teacher",
         default=None,

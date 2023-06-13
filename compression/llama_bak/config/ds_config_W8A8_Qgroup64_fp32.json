@@ -1,6 +1,6 @@
 {
-"train_batch_size" : 8,
-"train_micro_batch_size_per_gpu": 8,
+"train_batch_size" : 2,
+"train_micro_batch_size_per_gpu": 2,
 "steps_per_print": 50,
 "gradient_accumulation_steps": 1,
 
@@ -54,7 +54,8 @@
             "quantization_period": 0
         },
         "modules": [
-          "attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"
+          "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+          "mlp.gate_proj", "mlp.down_proj", "mlp.up_proj"
         ]
       }      
     }
@@ -72,7 +73,8 @@
             "bits": 8
         },
         "modules": [
-          "attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"
+          "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+          "mlp.gate_proj", "mlp.down_proj", "mlp.up_proj"
         ]
       }
     }

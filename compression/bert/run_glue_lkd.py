@@ -162,10 +162,10 @@ def parse_args():
     parser.add_argument("--lkd_enabled", action="store_true", help="using lkd or not")
     parser.add_argument("--distill_method", type=str, default=None, help="knowledage distillation")   
     parser.add_argument(
-        "--local_rank",
+        "--local-rank",
         type=int,
         default=-1,
-        help="local_rank for distributed training on gpus")
+        help="local-rank for distributed training on gpus")
     parser.add_argument(
         "--model_name_or_path_teacher",
         default=None,

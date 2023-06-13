@@ -37,6 +37,8 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
+from datasets.arrow_dataset import Dataset
+from transformers import LlamaForCausalLM, LlamaTokenizer
 from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
@@ -220,6 +222,19 @@ def parse_args():
     return args
 
 
+def get_llama(model):
+
+    def skip(*args, **kwargs):
+        pass
+
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    from transformers import LlamaForCausalLM
+    model = LlamaForCausalLM.from_pretrained(model, torch_dtype=torch.float16)
+    model.seqlen = 2048
+    return model
+
 def main():
     args = parse_args()
 
@@ -249,160 +264,20 @@ def main():
 
     torch.distributed.barrier()
 
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        extension = args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-            dataset_args["keep_linebreaks"] = not args.no_keep_linebreaks
-        raw_datasets = load_dataset(extension, data_files=data_files, **dataset_args)
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{args.validation_split_percentage}%]",
-                **dataset_args,
-            )
-            raw_datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{args.validation_split_percentage}%:]",
-                **dataset_args,
-            )
-
-    
-    if args.model_name_or_path is not None:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
-    else:
-        config = CONFIG_MAPPING[args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-    #print (config)
-    if args.not_tie_wre:
-        config.tie_word_embeddings=False    
-
-
-    if args.model_name_or_path is not None:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
-    if args.model_name_or_path:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
-    else:
-        print_rank_0("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config)
-
-    model.resize_token_embeddings(len(tokenizer))
+    # get model
+    model = get_llama(args.model_name_or_path)
     model.to(device)
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
-    column_names = raw_datasets["train"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
 
-    def tokenize_function(examples):
-        return tokenizer(examples[text_column_name])
-
-    tokenized_datasets = raw_datasets.map(
-            tokenize_function,
-            batched=True,
-            num_proc=args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not args.overwrite_cache,
-            desc="Running tokenizer on dataset",
-        )
-
-    if args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > 1024:
-            logger.warning(
-                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
-                "Picking 1024 instead. You can change that default value by passing --block_size xxx."
-            )
-        block_size = 1024
-    else:
-        if args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({args.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(args.block_size, tokenizer.model_max_length)
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    lm_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
-            num_proc=args.preprocessing_num_workers,
-            load_from_cache_file=not args.overwrite_cache,
-            desc=f"Grouping texts in chunks of {block_size}",
-        )
-
-    train_dataset = lm_datasets["train"]
-    eval_dataset = lm_datasets["validation"]
-
-    # train_dataset = torch.load(f'{args.data_folder}/train_dataset.pt') #lm_datasets["train"]
-    # eval_dataset = torch.load(f'{args.data_folder}/eval_dataset.pt') #lm_datasets["validation"]
-
-    # Log a few random samples from the training set:
-    # for index in random.sample(range(len(train_dataset)), 3):
-    #     print_rank_0(f"Sample {index} of the training set: {train_dataset[index]}.")
-
-    # DataLoaders creation:
-    if args.local_rank == -1:
-        train_sampler = RandomSampler(train_dataset)
-    else:
-        train_sampler = DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(
-        train_dataset, collate_fn=default_data_collator, sampler=train_sampler, batch_size=args.per_device_train_batch_size
-    )
-    eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, sampler=eval_sampler, batch_size=args.per_device_eval_batch_size
-    )
-
-    # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
-    # shorter in multiprocess)
+    # import pdb;pdb.set_trace()
+    
+    # get dataloaders
+    from datautils import get_loaders
+    train_dataloader, eval_dataloader = get_loaders(
+        args.dataset_name, 
+        # nsamples=1600*8,
+        nsamples=128,
+        model=args.model_name_or_path, 
+        seqlen=model.seqlen)
 
     # Scheduler and math around the number of training steps.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -413,7 +288,7 @@ def main():
         
     # Train!
     print_rank_0("***** Running training *****")
-    print_rank_0(f"  Num examples = {len(train_dataset)}")
+    print_rank_0(f"  Num examples = {len(train_dataloader)}")
     print_rank_0(f"  Num Epochs = {args.num_train_epochs}")
     print_rank_0(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
     print_rank_0(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
@@ -422,33 +297,55 @@ def main():
 
     num_p = sum([p.numel() for p in model.parameters()])
     print_rank_0('Number of parameters: {}'.format(num_p))
+    
+    def fold_tokens(tokens: torch.Tensor, batch_seq_len=2048):
+        # tokens: 1 N
+        N = tokens.shape[1]
+        num_drop = N % batch_seq_len
+        if num_drop != 0:
+            tokens = tokens[:, :-num_drop]
+        tokens = tokens.reshape([-1, batch_seq_len])  # B N
+        return tokens
 
-    def to_device(batch):
-        output = {}
-        for k, v in batch.items():
-            try:
-                output[k] = v.to(device)
-            except:
-                output[k] = v
-        return output
+    @torch.no_grad()
+    def evaluation(model,
+                    testenc,
+                    batch_size=16,
+                    is_engine=False):
+        print_rank_0('Evaluating ...')
+        
+        if is_engine:
+            engine = model
+            model = model.module
 
-    def evaluation(model, eval_dataloader):
-        model.eval()
-        losses = []
-        for step, batch in enumerate(eval_dataloader):
-            # batch = tuple(t.to(device) for t in batch)
-            batch = to_device(batch)
-            with torch.no_grad():
-                outputs = model(**batch)
+        seqlen = model.seqlen
 
-            loss = outputs.loss
-            losses.append(loss.cpu().item())
-        losses = losses[: len(eval_dataset)]
-        try:
-            perplexity = math.exp(np.mean(losses))
-        except OverflowError:
-            perplexity = float("inf")
-        return perplexity
+        testenc: torch.Tensor = testenc.input_ids  # type: ignore # 1, N
+        testenc = fold_tokens(testenc, seqlen)  # B N
+
+        use_cache = model.config.use_cache
+        model.config.use_cache = False
+        nlls = []
+
+        for i, batch in enumerate(torch.split(testenc, batch_size)):
+            B = batch.shape[0]
+
+            batch = batch.to(device)
+            if is_engine:
+                out: torch.Tensor = engine(batch)[0]  # 1
+            else:
+                out: torch.Tensor = model(batch)[0]
+            shift_logits = out[:, :-1, :].contiguous().flatten(0, 1)  # (B N) C
+            shift_labels = batch[:, 1:].flatten()  # (B N)
+
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits, shift_labels)
+            neg_log_likelihood = loss.float() * seqlen * B
+            nlls.append(neg_log_likelihood)
+
+        ppl = torch.exp(torch.stack(nlls).sum() / (testenc.numel()))
+        print_rank_0(f'Perplexity: {ppl.item():3f}')
+        model.config.use_cache = use_cache
 
 
     def training(model, train_dataloader, eval_dataloader, num_train_epochs, args):
@@ -466,7 +363,8 @@ def main():
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)    
+        # optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)     
 
         lr_scheduler = get_scheduler(
                 name=args.lr_scheduler_type,
@@ -480,16 +378,19 @@ def main():
             args=args,
             lr_scheduler=lr_scheduler,
             dist_init_required=True)
+
+        # import pdb;pdb.set_trace()
+
         # Only show the progress bar once on each machine.
         # completed_steps = 0
         for epoch in range(num_train_epochs):
             if epoch == 0:
-                perplexity = evaluation(model, eval_dataloader)
+                perplexity = evaluation(model, eval_dataloader, is_engine=True)
                 print_rank_0 (f"*************************initialization with {perplexity}***********************************")            
             model.train()
             for step, batch in enumerate(train_dataloader):
-                batch = to_device(batch)                
-                outputs = model(**batch, output_hidden_states=True, output_attentions=True)
+                batch = batch.to(device)                
+                outputs = model(batch, output_hidden_states=True, output_attentions=True)
                 loss = outputs.loss
                 # loss = loss / args.gradient_accumulation_steps
                 model.backward(loss)
@@ -498,11 +399,11 @@ def main():
             # Evaluate perplexity on the validation set.
             if epoch != args.num_train_epochs-1:
                 print_rank_0(f"***** Evaluating perplexity, Epoch {epoch+1}/{num_train_epochs} *****")
-                perplexity = evaluation(model, eval_dataloader)
+                perplexity = evaluation(model, eval_dataloader, is_engine=True)
                 print_rank_0(f"Epoch at {epoch+1} with Perplexity: {perplexity}")
             
         print_rank_0(f"***** Evaluating perplexity, Epoch {args.num_train_epochs}/{num_train_epochs} *****")
-        perplexity = evaluation(model, eval_dataloader)
+        perplexity = evaluation(model, eval_dataloader, is_engine=True)
         print_rank_0(f"Before cleaning, Epoch at {args.num_train_epochs} with Perplexity: {perplexity}")
         if args.output_dir is not None:
             print_rank_0('saving model ...')
@@ -521,8 +422,12 @@ def main():
 
     perplexity = evaluation(model, eval_dataloader)
     print_rank_0(f"Before converting the module COVN1D to linear, and before applying init_compression: {perplexity}")
+    
+    torch.distributed.barrier()
+
     model = convert_conv1d_to_linear(model, Conv1D)
     model = init_compression(model, args.deepspeed_config)
+    # import pdb;pdb.set_trace()
     print_rank_0('WARNING: saving the quantized model with Linear Module instead of COV1D')
 
     training(model, train_dataloader, eval_dataloader, args.num_train_epochs, args)

@@ -1,24 +1,18 @@
 {
-"train_batch_size" : 8,
-"train_micro_batch_size_per_gpu": 8,
+"train_batch_size" : 3,
+"train_micro_batch_size_per_gpu": 1,
 "steps_per_print": 50,
 "gradient_accumulation_steps": 1,
 
 "optimizer": {
   "type": "Adam",
   "params": {
-    "lr": 0.001,
-    "betas": [
-      0.8,
-      0.999
-    ],
-    "eps": 1e-8,
-    "weight_decay": 3e-7
+    "lr": 5e-6
   }
 },
 
 "zero_optimization": {
-  "stage": 0
+  "stage": 3
 },
 
 "fp16":{
@@ -26,7 +20,7 @@
 },
 
 "gradient_clipping": 1.0,
-"prescale_gradients": true,
+"prescale_gradients": false,
 
 "wall_clock_breakdown" : false,
 
@@ -36,7 +30,7 @@
       "enabled": true,
       "quantizer_kernel": false,
       "schedule_offset": 0,
-      "quantize_groups": 64,
+      "quantize_groups": 128,
       "quantize_verbose": false,
       "quantization_type": "symmetric",
       "quantize_weight_in_forward": true,
@@ -54,7 +48,8 @@
             "quantization_period": 0
         },
         "modules": [
-          "attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"
+          "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+          "mlp.gate_proj", "mlp.down_proj", "mlp.up_proj"
         ]
       }      
     }
@@ -62,7 +57,7 @@
   "activation_quantization": {
     "shared_parameters":{
       "enabled": true,
-      "quantization_type": "symmetric",
+      "quantization_type": "asymmetric",
       "range_calibration": "dynamic",
       "schedule_offset": 0
     },
@@ -72,7 +67,8 @@
             "bits": 8
         },
         "modules": [
-          "attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"
+          "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+          "mlp.gate_proj", "mlp.down_proj", "mlp.up_proj"
         ]
       }
     }

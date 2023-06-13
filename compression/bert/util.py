@@ -113,6 +113,69 @@ def replace_config(args, config, model_tmp, label_list, num_labels=2,label_to_id
             for label, id in config.label2id.items()
         }
 
+def get_llama(model):
+
+    def skip(*args, **kwargs):
+        pass
+
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    from transformers import LlamaForCausalLM
+    model = LlamaForCausalLM.from_pretrained(model, torch_dtype=torch.float16)
+    model.seqlen = 2048
+    return model
+
+def fold_tokens(tokens: torch.Tensor, batch_seq_len=2048):
+    # tokens: 1 N
+    N = tokens.shape[1]
+    num_drop = N % batch_seq_len
+    if num_drop != 0:
+        tokens = tokens[:, :-num_drop]
+    tokens = tokens.reshape([-1, batch_seq_len])  # B N
+    return tokens
+
+@torch.no_grad()
+def evaluation(model,
+                testenc,
+                device,
+                batch_size=8,
+                seqlen=2048,
+                is_engine=False):
+    
+    if is_engine:
+        engine = model
+        model = model.module
+
+    testenc: torch.Tensor = testenc.input_ids  # type: ignore # 1, N
+    testenc = fold_tokens(testenc, seqlen)  # B N
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    nlls = []
+
+    for i, batch in enumerate(torch.split(testenc, batch_size)):
+        B = batch.shape[0]
+
+        batch = batch.to(device)
+        if is_engine:
+            out: torch.Tensor = engine(batch)[0]  # 1
+        else:
+            out: torch.Tensor = model(batch)[0]
+        shift_logits = out[:, :-1, :].contiguous().flatten(0, 1)  # (B N) C
+        shift_labels = batch[:, 1:].flatten()  # (B N)
+
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits, shift_labels)
+        neg_log_likelihood = loss.float() * seqlen * B
+        nlls.append(neg_log_likelihood)
+
+    ppl = torch.exp(torch.stack(nlls).sum() / (testenc.numel()))
+    print_ppl = round(ppl.item(), 6)
+    model.config.use_cache = use_cache
+    return print_ppl
+
+
 
 def do_eval(args, model, eval_dataloader, mm_eval_dataloader, device, is_regression=False):
     model.eval()
