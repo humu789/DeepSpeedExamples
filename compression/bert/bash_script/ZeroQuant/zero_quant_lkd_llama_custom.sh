@@ -2,29 +2,27 @@
 
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%. run_jobs.sh (for mnli)
 # "quantize_groups": 128
-export CUDA_VISIBLE_DEVICES=4
-BATCH_SIZE_TRAIN=4
-TRAIN_STEPS=$((6400 * 4 / BATCH_SIZE_TRAIN))
-CONFIG=./config/ZeroQuant/ds_config_W4A8_Qgroup128_lkd_fp32.json
-SAVE_PATH=./out/ZeroQuant/W4A8_quantization_llama_except-last-layer
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+BATCH_SIZE_TRAIN=8
+TRAIN_STEPS=$((200 * 8 / BATCH_SIZE_TRAIN))
+CONFIG=./config/ZeroQuant/ds_config_zeroquant-lkd_custom.json
+SAVE_PATH=./out/ZeroQuant/W4A8_quantization_llama_custom
 mkdir -p ${SAVE_PATH}
-python -m torch.distributed.launch --nproc_per_node=1 \
+OMP_NUM_THREADS=16 python -m torch.distributed.launch --nproc_per_node=4 \
   --master_port 10004 \
-  run_lkd_llama.py \
+  run_lkd_llama_multi.py \
   --dataset_name wikitext2 \
   --seed 42 \
-  --distill_method one_stage \
   --model_name_or_path /nvme/share_data/llama_ckpts/huggingface/7B \
-  --per_device_train_batch_size ${BATCH_SIZE_TRAIN} \
-  --per_device_eval_batch_size 8 \
+  --train_batch_size ${BATCH_SIZE_TRAIN} \
+  --eval_batch_size 8 \
   --deepspeed_config ${CONFIG} \
   --deepspeed \
   --max_train_steps ${TRAIN_STEPS} \
   --num_warmup_steps 0 \
   --learning_rate 5e-7 \
-  --save_best_model --clean_best_model \
   --gradient_accumulation_steps 1 \
-  --output_dir ${SAVE_PATH} &>> ${SAVE_PATH}/lkd_llama_w4-sys-g128_a8-asys_step6400_lr5e-7_skip2.log
+  --output_dir ${SAVE_PATH} #&>> ${SAVE_PATH}/lkd_llama_w4-sys-g128_a8-asys_step800_lr5e-7_skip2_31.log
 
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% users provide models  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 # MODEL_BASE=/blob/users/xwu/compression/huggingface_models/bert_base_uncased ## or you could use bert-base-uncased

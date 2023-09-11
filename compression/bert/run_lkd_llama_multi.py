@@ -77,13 +77,13 @@ def parse_args():
         required=True,
     )
     parser.add_argument(
-        "--per_device_train_batch_size",
+        "--train_batch_size",
         type=int,
         default=64,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
-        "--per_device_eval_batch_size",
+        "--eval_batch_size",
         type=int,
         default=32,
         help="Batch size (per device) for the evaluation dataloader.",
@@ -128,39 +128,11 @@ def parse_args():
     #############deepspeed, compression, and knowledage distillation#########
     parser.add_argument("--deepspeed", action="store_true", help="use deepspeed or not")
     parser.add_argument("--deepspeed_config", type=str, default=None, help="deepspeed config")   
-    parser.add_argument("--save_best_model", action="store_true",  help="save best checkpoint model")
-    parser.add_argument("--clean_best_model", action="store_true", help="clean the  model")
-    parser.add_argument("--lkd_enabled", action="store_true", help="using lkd or not")
-    parser.add_argument("--distill_method", type=str, default=None, help="knowledage distillation")   
     parser.add_argument(
         "--local-rank",
         type=int,
         default=-1,
         help="local-rank for distributed training on gpus")
-    parser.add_argument(
-        "--model_name_or_path_teacher",
-        default=None,
-        type=str,
-        help=
-        "Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    
-    parser.add_argument(
-        "--pretrained_dir_student",
-        type=str,
-        default=None,
-        help="Where to load the student pretrained model.")
-    parser.add_argument(
-        "--pretrained_dir_teacher",
-        type=str,
-        default=None,
-        help="Where to load the teacher pretrained model.")
-    parser.add_argument(
-        "--eval_step",
-        type=int,
-        default=1000,
-        help="when to eval the model.")
-
     args = parser.parse_args()
 
     return args
@@ -169,21 +141,13 @@ def parse_args():
 def main():
     args = parse_args()
     print_rank_0 = print_rank(args)
-    ds_config = None
-    if args.deepspeed:
-        with open(args.deepspeed_config) as f:
-            ds_config = json.load(f)
-        layer_reduction_enabled, prune_enabled, quantization_enabled = check_and_identify_compresssion(args, ds_config)
-        args.layer_reduction_enabled = layer_reduction_enabled
+
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-
-    if args.lkd_enabled:
-        assert args.distill_method != "zero_stage", "zero_stage is not supported for lkd since we need the teacher model"
 
     # Setup logging, we only want one process per machine to log things on the screen.
     # accelerator.is_local_main_process is only True for one process per machine.
@@ -196,9 +160,8 @@ def main():
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
-        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        #torch.distributed.init_process_group(backend='nccl')
         deepspeed.init_distributed()
+
     if args.seed is not None:
         set_seed(args.seed)
         random.seed(args.seed)
@@ -210,108 +173,40 @@ def main():
     # Load pretrained model and tokenizer
     from util import get_llama
     model = get_llama(args.model_name_or_path)
-    model.to(device)
-
-    # ppl = evaluation(model, 
-    #                  testenc, 
-    #                  device,
-    #                  batch_size=args.per_device_eval_batch_size,
-    #                  is_engine=False)
-    # print_rank_0(f"before compression, the float model's performance: {ppl}")
-
-    teacher_model  = None
-    #### load teacher models
-    if args.distill_method != 'zero_stage':
-        if not args.model_name_or_path_teacher:
-            args.model_name_or_path_teacher = args.model_name_or_path
-        teacher_model = get_llama(args.model_name_or_path_teacher)
-        teacher_model.to(device)
-        if args.pretrained_dir_teacher is not None:
-            teacher_model.load_state_dict(
-                torch.load(args.pretrained_dir_teacher))
-            
-    # model inititalization, config,
-    if args.deepspeed:
-        if quantization_enabled or prune_enabled or layer_reduction_enabled:
-            model = init_compression(model, args.deepspeed_config, teacher_model=teacher_model)  #<==========================================compression argument
-
+    teacher_model = copy.copy(model)
+    student_model = init_compression(model, args.deepspeed_config)  #<==========================================compression argument
+    teacher_model.to(device)
     print_rank_0(f'################# init_compression finished ################')
 
-    if args.pretrained_dir_student is not None:
-            model.load_state_dict(torch.load(args.pretrained_dir_student))  #<==========================================add weight to students if users provides difference models
-    
     # get the dataset.
     from datautils import get_loaders
-    nsamples = args.max_train_steps * args.per_device_train_batch_size
+    nsamples = args.max_train_steps * args.train_batch_size
     train_dataset, testenc = get_loaders(
         args.dataset_name,
         nsamples=nsamples,
         model=args.model_name_or_path,
-        seqlen=2048)
+        seqlen=model.seqlen)
     
     from torch.utils.data import DataLoader
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=args.per_device_train_batch_size
+        batch_size=args.train_batch_size
     )
-
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
-
-    model, _, _, _ = deepspeed.initialize(
-            args=args,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            dist_init_required=True)
     
-    print_rank_0(f'################# Deepspeed init finished ################')
-    
-    ppl = evaluation(model, 
-                     testenc, 
-                     device,
-                     batch_size=args.per_device_eval_batch_size,
-                     is_engine=True)
-    print_rank_0(f"at step 0 (without LKD) the (student) model's performance: {ppl}")
-    
-    model.eval()
-    teacher_model.eval()
+    print_rank_0(f'################# train_dataloader is ready! ################')
+
     start_time = time.time()
-
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps =  math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
     
     skip_indexs = [2, 31]
     layer_start = 0
-    for l in range(layer_start, model.module.config.num_hidden_layers):
+    for l in range(layer_start, student_model.config.num_hidden_layers):
         if l in skip_indexs:
             print_rank_0(f'skip layer {l}')
         else:
             print_rank_0(f"KD layer {l}")
-            student_layer = recursive_getattr(model.module.model, f'layers.{l}')  # extract the lth layer of student
-            
-            # import pdb;pdb.set_trace()
-            
+            student_layer = recursive_getattr(student_model.model, f'layers.{l}')  # extract the lth layer of student
+            student_layer.to(device)
+
             no_decay = ["bias", "LayerNorm.weight"]
             optimizer_param = [
             {
@@ -322,13 +217,15 @@ def main():
                 "params": [p for n, p in student_layer.named_parameters() if any(nd in n for nd in no_decay)],
                 "weight_decay": 0.0,
             },
-            ]  
+            ]
 
-            # if l == 2:
-            #     optimizer = AdamW(optimizer_param, lr=args.learning_rate*0.1)
-            # else:
-            #     optimizer = AdamW(optimizer_param, lr=args.learning_rate) 
-            optimizer = AdamW(optimizer_param, lr=args.learning_rate)
+            optimizer = torch.optim.AdamW(optimizer_param, lr=args.learning_rate)
+
+            student_layer, optimizer, _, _ = deepspeed.initialize(
+                args=None,
+                model=student_layer,
+                optimizer=optimizer,
+                config=args.deepspeed_config)
 
             for i, batch in enumerate(train_dataloader):  # load each batch
                 batch = to_device(batch, device)
@@ -350,22 +247,25 @@ def main():
                 if i % 100 == 0:
                     print_rank_0(f'step{i} loss: {loss.item()}')
             
-            ppl = evaluation(model, 
+            del student_layer
+            
+            student_model.to(device)
+            ppl = evaluation(student_model, 
                             testenc, 
                             device,
-                            batch_size=args.per_device_eval_batch_size,
-                            is_engine=True)
+                            batch_size=args.eval_batch_size,
+                            is_engine=False)
+            student_model.cpu()
             print_rank_0(f"layer {l} is finished, the (student) model's performance: {ppl}")
-            
-            # import pdb;pdb.set_trace()
     
     del teacher_model
 
-    ppl = evaluation(model, 
+    student_model.to(device)
+    ppl = evaluation(student_model, 
                      testenc, 
                      device,
-                     batch_size=args.per_device_eval_batch_size,
-                     is_engine=True)
+                     batch_size=args.eval_batch_size,
+                     is_engine=False)
     print_rank_0(f"After {time.time() - start_time}s, (with LKD) the (student) model's performance: {ppl}")
     
 

@@ -38,6 +38,7 @@ def print_rank(args):
         if args.local_rank <= 0:
             print(msg)
     return _print_rank_0
+
 def to_device(batch, device):
     output = {}
     for k, v in batch.items():
